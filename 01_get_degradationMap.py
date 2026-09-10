@@ -11,8 +11,11 @@
 # FINAL PRIMARY BAND ORDER:
 #   TTF, TTFd, TTS, TTCe, TTP, TTA, TTW, OTH, completeness
 #
-# IMPORTANT MISSING-DATA INTERPRETATION:
+# IMPORTANT MISSING-DATA / LEGEND INTERPRETATION:
 #   MapBiomas class 27 ("Nao Observado") is treated as missing, NOT OTH.
+#   Any other unexpected observed MapBiomas code follows the original JS:
+#       it remains valid and defaults to OTH,
+#       while a QA flag records its presence.
 #
 # EARLY-YEAR TEMPORAL PROXIES:
 #   target 1979-1984:
@@ -104,10 +107,10 @@ STRICT_ASSET_CHECK = True
 # ------------------------------------------------------------------------------
 
 START_YEAR = 1985
-END_YEAR = 2019
+END_YEAR = 2024
 
 FINAL_START_YEAR = 1979
-FINAL_END_YEAR = 2019
+FINAL_END_YEAR = 2024
 
 SECONDARY_START_YEAR = 1987
 
@@ -166,7 +169,7 @@ SUM_TOLERANCE = 1e-6
 
 # In a fresh Colab runtime first run:
 #
-ee.Authenticate()
+# ee.Authenticate()
 #
 # Then initialize:
 ee.Initialize(project=EE_PROJECT)
@@ -441,8 +444,10 @@ BASE_TO = (
 )
 
 
-# Any other observed value is an error / unmapped code.
-UNMAPPED_SENTINEL = 255
+# QA note:
+# unexpected observed codes are flagged by unknown_class QA, but final
+# classification follows the original JS behavior and keeps them as OTH.
+UNMAPPED_SENTINEL = 255  # retained only as a legacy/debug constant
 
 
 # ==============================================================================
@@ -534,22 +539,73 @@ def strict_base_reclass(
     lulc_year,
 ):
     """
-    Strict base reclassification.
+    JS-compatible base reclassification.
 
-    Unmapped values receive sentinel 255.
+    Every OBSERVED MapBiomas code starts as OTH, matching the original
+    JavaScript rule:
 
-    Class 27 also receives 255 here and is later explicitly treated as
-    missing rather than as an output category.
+        output = lulcYear * 0 + OUT.OTH
+
+    Then known forest / savanna / pasture / agriculture / water classes
+    overwrite OTH.
+
+    Class 27 ("Nao Observado") is handled separately as MISSING and masked
+    from the final annual classification.
+
+    Unknown observed codes remain OTH in the final product, but are flagged
+    separately by QA so legend surprises are visible rather than silent.
     """
-    return (
+
+    output = (
         lulc_year
-        .remap(
-            BASE_FROM,
-            BASE_TO,
-            UNMAPPED_SENTINEL,
+        .multiply(0)
+        .add(
+            OUT['OTH']
         )
         .toUint16()
     )
+
+    output = output.where(
+        is_in_codes(
+            lulc_year,
+            CODES_FOREST,
+        ),
+        OUT['TTF'],
+    )
+
+    output = output.where(
+        is_in_codes(
+            lulc_year,
+            CODES_TTCE,
+        ),
+        OUT['TTCe'],
+    )
+
+    output = output.where(
+        is_in_codes(
+            lulc_year,
+            CODES_TTP,
+        ),
+        OUT['TTP'],
+    )
+
+    output = output.where(
+        is_in_codes(
+            lulc_year,
+            CODES_TTA,
+        ),
+        OUT['TTA'],
+    )
+
+    output = output.where(
+        is_in_codes(
+            lulc_year,
+            CODES_TTW,
+        ),
+        OUT['TTW'],
+    )
+
+    return output
 
 
 def zero_like(
@@ -739,7 +795,11 @@ def build_year(
 
 
     # --------------------------------------------------------------------------
-    # Strict base map.
+    # Base map.
+    #
+    # JS-compatible behavior:
+    #   every observed non-27 source code is assigned to one of the 8 outputs;
+    #   unexpected codes default to OTH.
     # --------------------------------------------------------------------------
 
     base_raw = (
@@ -750,9 +810,10 @@ def build_year(
 
 
     # --------------------------------------------------------------------------
-    # Observed source pixel.
+    # Observed / valid source pixel.
     #
-    # Class 27 = missing.
+    # The only MapBiomas legend value explicitly treated as missing is 27
+    # ("Nao Observado"), plus native source mask gaps.
     # --------------------------------------------------------------------------
 
     observed = (
@@ -770,52 +831,43 @@ def build_year(
     )
 
 
-    # --------------------------------------------------------------------------
-    # Unexpected observed codes.
-    # --------------------------------------------------------------------------
-
-    unknown_class = (
+    valid_class = (
         observed
-        .And(
-            base_raw
-            .unmask(
-                UNMAPPED_SENTINEL,
-                False,
-            )
-            .eq(
-                UNMAPPED_SENTINEL
-            )
-        )
         .rename(
-            f'unknown_class_{year}'
+            f'valid_class_{year}'
         )
         .toByte()
     )
 
 
     # --------------------------------------------------------------------------
-    # Valid annual classification.
+    # Unexpected observed codes.
     #
-    # Must:
-    #   exist in source
-    #   not be class 27
-    #   be explicitly mapped
+    # IMPORTANT:
+    # They are QA-FLAGGED but remain valid OTH pixels in the final output,
+    # matching the original JavaScript "default OTH" behavior.
     # --------------------------------------------------------------------------
 
-    valid_class = (
+    known_codes = (
+        BASE_FROM
+        + [CODE_NOT_OBSERVED]
+    )
+
+    unknown_class = (
         observed
         .And(
-            base_raw
-            .unmask(
-                UNMAPPED_SENTINEL,
-                False,
+            is_in_codes(
+                lulc_year,
+                known_codes,
             )
-            .neq(
-                UNMAPPED_SENTINEL
+            .Not()
+            .unmask(
+                0,
+                False,
             )
         )
         .rename(
-            f'valid_class_{year}'
+            f'unknown_class_{year}'
         )
         .toByte()
     )
@@ -1967,20 +2019,36 @@ def annual_qa_from_materialized(
 
     # --------------------------------------------------------------------------
     # Sum of the eight fractions.
+    #
+    # CRITICAL:
+    # Use ordinary image arithmetic rather than Image.reduce(Reducer.sum()).
+    # The latter can interact with fractional masks/weights and previously
+    # produced spurious values such as 1/255.
     # --------------------------------------------------------------------------
 
     sum8 = (
-
-        product
-
-        .select(
-            FRACTION_BANDS
+        product.select('TTF')
+        .add(
+            product.select('TTFd')
         )
-
-        .reduce(
-            ee.Reducer.sum()
+        .add(
+            product.select('TTS')
         )
-
+        .add(
+            product.select('TTCe')
+        )
+        .add(
+            product.select('TTP')
+        )
+        .add(
+            product.select('TTA')
+        )
+        .add(
+            product.select('TTW')
+        )
+        .add(
+            product.select('OTH')
+        )
         .rename(
             'sum8'
         )
@@ -2528,6 +2596,12 @@ def make_primary_export_task(
 
             'low_completeness_threshold':
                 COMPLETENESS_THRESHOLD,
+
+            'unexpected_class_handling':
+                'default OTH + QA flag',
+
+            'not_observed_handling':
+                'class 27 = missing',
         })
     )
 
@@ -2916,6 +2990,13 @@ def write_metadata_files():
                 'as missing rather than OTH.'
             ),
 
+        'unexpected_class_handling':
+            (
+                'Observed source codes outside the explicit legend mapping '
+                'remain valid and default to OTH, matching the original JS '
+                'workflow; they are also reported by unknown-class QA.'
+            ),
+
         'final_band_order':
             FINAL_BANDS,
 
@@ -3065,17 +3146,28 @@ def inspect_materialized_cell(
 
 
     sum8 = (
-
-        product
-
-        .select(
-            FRACTION_BANDS
+        product.select('TTF')
+        .add(
+            product.select('TTFd')
         )
-
-        .reduce(
-            ee.Reducer.sum()
+        .add(
+            product.select('TTS')
         )
-
+        .add(
+            product.select('TTCe')
+        )
+        .add(
+            product.select('TTP')
+        )
+        .add(
+            product.select('TTA')
+        )
+        .add(
+            product.select('TTW')
+        )
+        .add(
+            product.select('OTH')
+        )
         .rename(
             'SUM_8'
         )
@@ -3310,6 +3402,31 @@ if (
             )
 
 
+        # ----------------------------------------------------------------------
+        # Practical release gate.
+        # ----------------------------------------------------------------------
+
+        hard_failures = (
+            qa_df.loc[
+                ~qa_df[
+                    'sum_qc_pass'
+                ]
+            ]
+        )
+
+        if len(hard_failures) == 0:
+            print()
+            print(
+                'HARD QA GATE: PASS '
+                '(all annual fraction sums within tolerance).'
+            )
+        else:
+            print()
+            print(
+                'HARD QA GATE: FAIL — inspect sum-of-fractions before release.'
+            )
+
+
         # TTS/degradation overlap.
         high_overlap = (
 
@@ -3368,7 +3485,8 @@ if (
             print()
 
             print(
-                'WARNING: unexpected MapBiomas classes found:'
+                'NOTE: unexpected MapBiomas classes found. '
+                'They were retained as valid OTH pixels, matching the JS rule:'
             )
 
             print(
